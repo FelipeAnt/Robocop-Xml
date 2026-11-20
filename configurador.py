@@ -18,6 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+import segredo
+
 BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) \
     else Path(__file__).resolve().parent
 CONFIG_FILE = str(BASE_DIR / "config.json")
@@ -45,7 +47,7 @@ class ConfiguradorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Configurador - Robocop Clone")
-        self.root.geometry("720x560")
+        self.root.geometry("720x640")
         self.root.resizable(False, False)
 
         self.cfg = carregar_config_existente()
@@ -97,7 +99,16 @@ class ConfiguradorApp:
         ttk.Label(frame_geral, text="Secret Access Key:").grid(row=2, column=0, sticky="w", padx=8, pady=4)
         self.entry_secret_key = ttk.Entry(frame_geral, width=45, show="*")
         self.entry_secret_key.grid(row=2, column=1, sticky="w", padx=8, pady=4)
-        self.entry_secret_key.insert(0, self.cfg.get("r2_secret_access_key", ""))
+        try:
+            secret_atual = segredo.revelar(self.cfg.get("r2_secret_access_key", ""))
+        except segredo.SegredoIndisponivel:
+            secret_atual = ""
+            messagebox.showwarning(
+                "Secret não abre neste PC",
+                "O Secret Access Key salvo no config.json foi criptografado em outro "
+                "computador e não abre aqui. Digite o Secret novamente e salve.",
+            )
+        self.entry_secret_key.insert(0, secret_atual)
 
         ttk.Label(frame_geral, text="Nome do bucket:").grid(row=3, column=0, sticky="w", padx=8, pady=4)
         self.entry_bucket = ttk.Entry(frame_geral, width=45)
@@ -114,6 +125,16 @@ class ConfiguradorApp:
         self.spin_workers = ttk.Spinbox(frame_geral, from_=1, to=20, width=5)
         self.spin_workers.set(self.cfg.get("num_workers", 4))
         self.spin_workers.grid(row=5, column=1, sticky="w", padx=8, pady=4)
+
+        ttk.Label(frame_geral, text="Nome do cliente:").grid(row=6, column=0, sticky="w", padx=8, pady=4)
+        self.entry_cliente = ttk.Entry(frame_geral, width=45)
+        self.entry_cliente.grid(row=6, column=1, sticky="w", padx=8, pady=4)
+        self.entry_cliente.insert(0, self.cfg.get("nome_cliente", ""))
+        ttk.Label(
+            frame_geral,
+            text="Aparece no monitoramento (heartbeat). Ex: 'Mercado Zilda'. Use um nome diferente por PC.",
+            foreground="#555555",
+        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 4))
 
         # --- Botão salvar ---
         frame_salvar = ttk.Frame(self.root)
@@ -269,9 +290,13 @@ class ConfiguradorApp:
         access_key = self.entry_access_key.get().strip()
         secret_key = self.entry_secret_key.get().strip()
         bucket = self.entry_bucket.get().strip()
+        nome_cliente = self.entry_cliente.get().strip()
 
         if not self.cfg.get("fontes"):
             messagebox.showerror("Nenhuma pasta", "Adicione ao menos uma pasta para monitorar.")
+            return
+        if not nome_cliente:
+            messagebox.showerror("Nome do cliente", "Informe o nome do cliente (usado no monitoramento).")
             return
         if not (account_id and access_key and secret_key and bucket):
             messagebox.showerror(
@@ -282,9 +307,21 @@ class ConfiguradorApp:
 
         self.cfg["r2_account_id"] = account_id
         self.cfg["r2_access_key_id"] = access_key
-        self.cfg["r2_secret_access_key"] = secret_key
+        aviso_segredo = ""
+        try:
+            protegido = segredo.proteger(secret_key)
+            if segredo.revelar(protegido) != secret_key:
+                raise RuntimeError("verificação falhou")
+            self.cfg["r2_secret_access_key"] = protegido
+            if segredo.esta_protegido(protegido):
+                aviso_segredo = "\n\nO Secret foi criptografado: só funciona neste computador."
+        except Exception as e:
+            self.cfg["r2_secret_access_key"] = secret_key
+            aviso_segredo = f"\n\nATENÇÃO: não consegui criptografar o Secret ({e}); ficou em texto puro."
         self.cfg["r2_bucket"] = bucket
         self.cfg["num_workers"] = int(self.spin_workers.get())
+        self.cfg["nome_cliente"] = nome_cliente
+        self.cfg.setdefault("heartbeat_minutos", 15)
 
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(self.cfg, f, indent=2, ensure_ascii=False)
@@ -294,6 +331,7 @@ class ConfiguradorApp:
             f"Configuração salva em {CONFIG_FILE}.\n\n"
             f"Agora rode robocop_clone.py para iniciar o monitoramento "
             f"(sem login nenhum — as credenciais já estão no config.json)."
+            + aviso_segredo
         )
 
 

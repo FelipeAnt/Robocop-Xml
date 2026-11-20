@@ -1,39 +1,36 @@
 """
-robocop_clone.py (v6 - Cloudflare R2, sem OAuth)
----------------------------------------------------
+robocop_clone.py (v7.1 - Cloudflare R2, Resiliência e Integridade Fiscal)
+-----------------------------------------------------------------------
 Monitora N pastas locais (NFC-e, NF-e, ou qualquer outra fonte de XML fiscal),
 cada uma com sua própria data de início, identifica CNPJ / ano / mês pelo
-conteúdo do XML, evita reenviar arquivo já processado (memória local em
-SQLite) e sobe para um bucket do Cloudflare R2, organizando por
-CNPJ/ano/mes/arquivo.xml (sem precisar criar "pastas" — R2/S3 não tem esse
-conceito, o nome do objeto já inclui o caminho completo).
+conteúdo do XML com suporte a NF-e, NFC-e, Eventos/Cancelamentos e Inutilizações.
 
-Diferente da versão com Google Drive, esta NÃO PRECISA de login interativo:
-usa uma Access Key + Secret Key estáticas, geradas uma vez no painel do
-Cloudflare. Isso elimina token expirando, modo de teste do Google, e a
-necessidade de rodar o script manualmente antes de virar serviço.
-
-Dependências:
-    pip install watchdog boto3
-
-Uso:
-    1. Rode configurador.py primeiro para gerar o config.json (pastas
-       monitoradas, credenciais do R2, nome do bucket).
-    2. Rode este script manualmente pra validar que está tudo certo.
-    3. Depois, instale como serviço do Windows (instalar_servico.bat).
+Recursos de Resiliência:
+- Memória local em SQLite com cache de stat (file_stat_cache) para varreduras rápidas.
+- Verificação robusta de integridade de arquivo antes de processar (stability).
+- Rotação de logs com RotatingFileHandler (10MB, 3 backups).
+- Retry com backoff exponencial para falhas temporárias de rede.
+- Varredura periódica de reconciliação (daemon) a cada 30 minutos.
+- Heartbeat periódico (_status/<cliente>.json no R2) para monitorar PCs remotamente.
+- Watchdog capturando eventos de criação, renomeação e modificação (on_created, on_moved, on_modified).
 """
 
 import json
 import logging
+from logging.handlers import RotatingFileHandler
+import os
 import queue
+import re
+import shutil
+import socket
 import sqlite3
 import sys
 import threading
 import time
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import boto3
 from botocore.config import Config as BotoConfig
@@ -41,20 +38,32 @@ from botocore.exceptions import ClientError
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
+import db_manager
+from db_manager import (
+    compute_file_hash,
+    check_stat_cache,
+    update_stat_cache,
+)
+import fiscal_parser
+import segredo
+from fiscal_parser import extract_fiscal_info, FiscalDocInfo
+import stability
+from stability import esperar_arquivo_estavel
+
 # ------------------------------------------------------------------
 # CONFIGURAÇÃO (carregada de config.json em tempo de execução)
 # ------------------------------------------------------------------
 
 if getattr(sys, "frozen", False):
-    # Rodando como .exe empacotado (PyInstaller): a pasta base é onde o
-    # executável está, não a pasta temporária de extração.
     BASE_DIR = Path(sys.executable).resolve().parent
 else:
     BASE_DIR = Path(__file__).resolve().parent
+
 CONFIG_FILE = str(BASE_DIR / "config.json")
 DB_PATH = str(BASE_DIR / "controle_upload.sqlite3")
 LOG_FILE = str(BASE_DIR / "robocop_clone.log")
 QUEUE_MAXSIZE = 50000
+VERSAO = "7.1"
 
 # Preenchidos em main() a partir do config.json
 R2_ACCOUNT_ID = ""
@@ -62,20 +71,45 @@ R2_ACCESS_KEY_ID = ""
 R2_SECRET_ACCESS_KEY = ""
 R2_BUCKET = ""
 NUM_WORKERS = 4
-FONTES = []  # lista de dicts {"pasta": ..., "data_inicio": datetime, "nome": ...}
+NOME_CLIENTE = ""
+HEARTBEAT_MIN = 15  # 0 desliga o heartbeat
+FONTES = []  # lista de dicts {"pasta": ..., "data_inicio": datetime, "nome": ..., "tipo": ...}
 
 NFE_NS = {"nfe": "http://www.portalfiscal.inf.br/nfe"}
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler()],
+    handlers=[
+        RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
 )
 log = logging.getLogger("robocop_clone")
 
 
+def migrar_segredo(cfg: dict, secret_puro: str):
+    """Instalações antigas guardam o secret em texto puro: criptografa e regrava
+    o config.json de forma atômica. Qualquer falha é ignorada (o robô continua
+    funcionando com o config atual)."""
+    try:
+        protegido = segredo.proteger(secret_puro)
+        if segredo.revelar(protegido) != secret_puro:
+            raise RuntimeError("verificação da criptografia falhou")
+        novo = dict(cfg)
+        novo["r2_secret_access_key"] = protegido
+        tmp = CONFIG_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(novo, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, CONFIG_FILE)
+        log.info("Secret do R2 no config.json agora está criptografado (DPAPI, só abre neste PC).")
+    except Exception as e:
+        log.warning(f"Não consegui criptografar o secret no config.json (segue em texto puro): {e}")
+
+
 def carregar_config():
     global R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, NUM_WORKERS, FONTES
+    global NOME_CLIENTE, HEARTBEAT_MIN
 
     cfg_path = Path(CONFIG_FILE)
     if not cfg_path.exists():
@@ -126,106 +160,79 @@ def carregar_config():
 
     R2_ACCOUNT_ID = cfg["r2_account_id"]
     R2_ACCESS_KEY_ID = cfg["r2_access_key_id"]
-    R2_SECRET_ACCESS_KEY = cfg["r2_secret_access_key"]
+    try:
+        R2_SECRET_ACCESS_KEY = segredo.revelar(cfg["r2_secret_access_key"])
+    except segredo.SegredoIndisponivel as e:
+        log.error(
+            "Não consegui abrir o Secret Access Key do config.json. Isso acontece quando o "
+            "config.json foi COPIADO de outro computador (o segredo só abre na máquina onde "
+            f"foi salvo) ou está corrompido. Rode o configurador.py neste PC e digite o "
+            f"Secret de novo. Detalhe: {e}"
+        )
+        sys.exit(1)
+    if segredo.disponivel() and not segredo.esta_protegido(cfg["r2_secret_access_key"]):
+        migrar_segredo(cfg, R2_SECRET_ACCESS_KEY)
     R2_BUCKET = cfg["r2_bucket"]
     NUM_WORKERS = int(cfg.get("num_workers", 4))
     FONTES = fontes
 
-
-# ------------------------------------------------------------------
-# BANCO LOCAL (memória de uploads)
-# ------------------------------------------------------------------
-
-_thread_local = threading.local()
-
-
-def get_conn() -> sqlite3.Connection:
-    if not hasattr(_thread_local, "conn"):
-        conn = sqlite3.connect(DB_PATH, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")
-        _thread_local.conn = conn
-    return _thread_local.conn
-
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS uploads (
-            file_hash TEXT PRIMARY KEY,
-            filename TEXT,
-            cnpj TEXT,
-            ano TEXT,
-            mes TEXT,
-            object_key TEXT,
-            uploaded_at TEXT
+    NOME_CLIENTE = str(cfg.get("nome_cliente", "")).strip()
+    if not NOME_CLIENTE:
+        NOME_CLIENTE = socket.gethostname()
+        log.warning(
+            f"'nome_cliente' não definido no config.json; usando o nome do PC ({NOME_CLIENTE}) "
+            f"no monitoramento. Defina o nome do cliente no configurador.py."
         )
-        """
-    )
-    conn.commit()
-    conn.close()
-
-
-def already_uploaded(file_hash: str) -> bool:
-    conn = get_conn()
-    cur = conn.execute("SELECT 1 FROM uploads WHERE file_hash = ?", (file_hash,))
-    return cur.fetchone() is not None
-
-
-def register_upload(file_hash, filename, cnpj, ano, mes, object_key):
-    conn = get_conn()
-    conn.execute(
-        "INSERT OR REPLACE INTO uploads VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (file_hash, filename, cnpj, ano, mes, object_key, datetime.now().isoformat()),
-    )
-    conn.commit()
-
-
-def file_hash(path: Path) -> str:
-    import hashlib
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    try:
+        HEARTBEAT_MIN = int(cfg.get("heartbeat_minutos", 15))
+    except (TypeError, ValueError):
+        HEARTBEAT_MIN = 15
 
 
 # ------------------------------------------------------------------
-# PARSER DO XML — funciona igual para NFC-e (modelo 65) e NF-e (modelo 55).
-# Para notas de SAÍDA (emitidas pelo cliente), organiza pelo CNPJ do emit.
-# Para notas de ENTRADA (compras/bonificação recebidas), organiza pelo CNPJ
-# do dest — é o cliente quem recebe, não quem emitiu.
+# BANCO LOCAL & COMPATIBILIDADE RETROATIVA (delegado a db_manager)
 # ------------------------------------------------------------------
+
+def init_db(db_path: Optional[str] = None):
+    target = db_path or DB_PATH
+    db_manager.init_db(target)
+
+
+def is_hash_uploaded(*args, **kwargs) -> bool:
+    if len(args) == 1 and isinstance(args[0], str):
+        return db_manager.is_hash_uploaded(DB_PATH, args[0])
+    return db_manager.is_hash_uploaded(*args, **kwargs)
+
+
+already_uploaded = is_hash_uploaded
+file_hash = compute_file_hash
+
+
+def register_upload(*args, **kwargs):
+    if len(args) == 6:
+        return db_manager.register_upload(DB_PATH, *args, **kwargs)
+    return db_manager.register_upload(*args, **kwargs)
+
+
+def get_conn(db_path: Optional[str] = None) -> sqlite3.Connection:
+    target = db_path or DB_PATH
+    return db_manager.get_conn(target)
+
+
+def close_conn(db_path: Optional[str] = None):
+    target = db_path or DB_PATH
+    db_manager.close_conn(target)
+
 
 def extract_nfce_info(xml_path: Path, usar_destinatario: bool = False):
-    try:
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
-
-        tag_pessoa = "dest" if usar_destinatario else "emit"
-        pessoa = root.find(f".//nfe:{tag_pessoa}/nfe:CNPJ", NFE_NS)
-        if pessoa is None:
-            pessoa = root.find(f".//nfe:{tag_pessoa}/nfe:CPF", NFE_NS)
-        dh_emi = root.find(".//nfe:ide/nfe:dhEmi", NFE_NS)
-        if dh_emi is None:
-            dh_emi = root.find(".//nfe:ide/nfe:dEmi", NFE_NS)
-
-        if pessoa is None or dh_emi is None:
-            return None
-
-        cnpj = pessoa.text.strip()
-        dh_texto = dh_emi.text.strip()[:10]
-        data_emissao = datetime.strptime(dh_texto, "%Y-%m-%d")
-
-        return cnpj, f"{data_emissao.year:04d}", f"{data_emissao.month:02d}", data_emissao
-    except Exception as e:
-        log.warning(f"Não consegui interpretar {xml_path.name}: {e}")
+    info = extract_fiscal_info(xml_path, usar_destinatario=usar_destinatario)
+    if info is None:
         return None
+    return info.cnpj, info.ano, info.mes, info.data_emissao
 
 
 # ------------------------------------------------------------------
-# CLOUDFLARE R2 (compatível com S3) — sem OAuth, credenciais estáticas
+# CLOUDFLARE R2 (compatível com S3)
 # ------------------------------------------------------------------
 
 def build_r2_client():
@@ -241,12 +248,6 @@ def build_r2_client():
 
 
 def upload_xml(client, local_path: Path, cnpj: str, ano: str, mes: str, tipo: str) -> str:
-    # Sem "criar pasta": o objeto já nasce com o caminho completo como nome.
-    # ano/mes/cnpj (não cnpj/ano/mes): assim "baixar o mês passado de todos
-    # os clientes" vira um único prefixo (ex: rclone copy r2:bucket/2026/08),
-    # em vez de precisar listar CNPJ por CNPJ.
-    # .../cnpj/saida/ ou .../cnpj/entrada/: separa visualmente nota própria
-    # de nota de compra/bonificação recebida, pra conferência.
     object_key = f"{ano}/{mes}/{cnpj}/{tipo}/{local_path.name}"
     client.upload_file(
         str(local_path),
@@ -258,7 +259,137 @@ def upload_xml(client, local_path: Path, cnpj: str, ano: str, mes: str, tipo: st
 
 
 # ------------------------------------------------------------------
-# FILA DE PROCESSAMENTO
+# MONITORAMENTO (HEARTBEAT) — o robô avisa periodicamente que está vivo
+# ------------------------------------------------------------------
+
+class Estatisticas:
+    """Contadores thread-safe usados no heartbeat."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.iniciado_em = datetime.now()
+        self.enviados = 0
+        self.ultimo_envio_em = None
+        self.erros_consecutivos = 0
+        self.ultimo_erro = None
+        self.ultimo_erro_em = None
+
+    def registrar_envio(self):
+        with self._lock:
+            self.enviados += 1
+            self.ultimo_envio_em = datetime.now()
+            self.erros_consecutivos = 0
+
+    def registrar_erro(self, msg: str):
+        with self._lock:
+            self.erros_consecutivos += 1
+            self.ultimo_erro = msg[:300]
+            self.ultimo_erro_em = datetime.now()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "iniciado_em": self.iniciado_em,
+                "enviados_sessao": self.enviados,
+                "ultimo_envio_em": self.ultimo_envio_em,
+                "erros_consecutivos": self.erros_consecutivos,
+                "ultimo_erro": self.ultimo_erro,
+                "ultimo_erro_em": self.ultimo_erro_em,
+            }
+
+
+stats = Estatisticas()
+
+
+def _iso(dt: Optional[datetime]) -> Optional[str]:
+    return dt.isoformat(timespec="seconds") if dt else None
+
+
+def _slug(texto: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", texto).strip("_") or "sem_nome"
+
+
+def chave_heartbeat() -> str:
+    host = socket.gethostname()
+    nome = _slug(NOME_CLIENTE)
+    base = nome if _slug(host).lower() == nome.lower() else f"{nome}__{_slug(host)}"
+    return f"_status/{base}.json"
+
+
+def montar_heartbeat() -> dict:
+    snap = stats.snapshot()
+    agora = datetime.now()
+    workers_vivos = sum(
+        1 for t in threading.enumerate() if t.name.startswith("worker-") and t.is_alive()
+    )
+    try:
+        total_db = db_manager.contar_uploads(DB_PATH)
+    except Exception:
+        total_db = None
+    try:
+        disco_livre_mb = shutil.disk_usage(str(BASE_DIR)).free // (1024 * 1024)
+    except Exception:
+        disco_livre_mb = None
+
+    return {
+        "cliente": NOME_CLIENTE,
+        "host": socket.gethostname(),
+        "versao": VERSAO,
+        "agora": _iso(agora),
+        "iniciado_em": _iso(snap["iniciado_em"]),
+        "intervalo_s": HEARTBEAT_MIN * 60,
+        "fila_pendente": fila_arquivos.qsize(),
+        "workers_esperados": NUM_WORKERS,
+        "workers_vivos": workers_vivos,
+        "enviados_sessao": snap["enviados_sessao"],
+        "total_enviados_db": total_db,
+        "ultimo_envio_em": _iso(snap["ultimo_envio_em"]),
+        "erros_consecutivos": snap["erros_consecutivos"],
+        "ultimo_erro": snap["ultimo_erro"],
+        "ultimo_erro_em": _iso(snap["ultimo_erro_em"]),
+        "disco_livre_mb": disco_livre_mb,
+        "fontes": [
+            {"nome": f["nome"], "pasta": str(f["pasta"]), "tipo": f["tipo"],
+             "existe": Path(f["pasta"]).exists()}
+            for f in FONTES
+        ],
+    }
+
+
+def enviar_heartbeat(client):
+    corpo = json.dumps(montar_heartbeat(), ensure_ascii=False).encode("utf-8")
+    client.put_object(
+        Bucket=R2_BUCKET,
+        Key=chave_heartbeat(),
+        Body=corpo,
+        ContentType="application/json",
+    )
+
+
+def heartbeat_loop(client, stop_event: Optional[threading.Event] = None):
+    intervalo = HEARTBEAT_MIN * 60
+    log.info(f"Heartbeat iniciado (a cada {HEARTBEAT_MIN} min) -> {chave_heartbeat()}")
+    falhando = False
+    while True:
+        try:
+            enviar_heartbeat(client)
+            if falhando:
+                log.info("Heartbeat voltou a funcionar.")
+            falhando = False
+        except Exception as e:
+            # Loga só na primeira falha da sequência para não poluir o log.
+            if not falhando:
+                log.warning(f"Falha ao enviar heartbeat (seguirá tentando): {e}")
+            falhando = True
+        if stop_event is not None:
+            if stop_event.wait(intervalo):
+                break
+        else:
+            time.sleep(intervalo)
+
+
+# ------------------------------------------------------------------
+# FILA DE PROCESSAMENTO COM RETRY & ESTABILIDADE
 # ------------------------------------------------------------------
 
 @dataclass
@@ -267,23 +398,17 @@ class ItemFila:
     data_inicio: datetime
     fonte_nome: str
     tipo: str = "saida"
+    tentativas: int = 0
 
 
 fila_arquivos: "queue.Queue[ItemFila]" = queue.Queue(maxsize=QUEUE_MAXSIZE)
 
 
-def esperar_arquivo_estavel(path: Path, tentativas=10, intervalo=0.5):
-    tamanho_anterior = -1
-    for _ in range(tentativas):
-        try:
-            tamanho_atual = path.stat().st_size
-        except FileNotFoundError:
-            return False
-        if tamanho_atual == tamanho_anterior and tamanho_atual > 0:
-            return True
-        tamanho_anterior = tamanho_atual
-        time.sleep(intervalo)
-    return True
+def agendar_retry(item: "ItemFila", delay: float):
+    """Agenda o reenfileiramento do item após 'delay' segundos, sem bloquear
+    o worker nem segurar um get() em aberto — evita corromper a contagem
+    interna de tarefas pendentes da Queue."""
+    threading.Timer(delay, fila_arquivos.put, args=(item,)).start()
 
 
 def worker_loop(client):
@@ -292,44 +417,78 @@ def worker_loop(client):
         try:
             processar_arquivo(item, client)
         except Exception as e:
-            log.error(f"Erro inesperado processando {item.path}: {e}")
+            log.error(f"Erro inesperado processando {item.path}: {e}", exc_info=True)
         finally:
             fila_arquivos.task_done()
 
 
 def processar_arquivo(item: ItemFila, client):
     path = item.path
-    if path.suffix.lower() != ".xml":
-        return
-    if not esperar_arquivo_estavel(path):
-        log.warning(f"Arquivo sumiu antes de estabilizar: {path}")
+    if not path.exists() or path.suffix.lower() != ".xml":
         return
 
-    h = file_hash(path)
-    if already_uploaded(h):
+    # 1. Fast-check no cache de stat (evita ler disco e calcular hash se já enviado)
+    is_up, cached_hash = check_stat_cache(DB_PATH, path)
+    if is_up:
         return
 
-    info = extract_nfce_info(path, usar_destinatario=(item.tipo == "entrada"))
+    # 2. Verificação de estabilidade do arquivo
+    if not esperar_arquivo_estavel(path, tentativas=3, intervalo=0.5):
+        if item.tentativas < 5:
+            item.tentativas += 1
+            delay = min(60, 2 ** item.tentativas)
+            log.warning(
+                f"[{item.fonte_nome}] [Tentativa {item.tentativas}/5] Arquivo instável ou em gravação: {path.name}. Reenfileirando em {delay}s..."
+            )
+            agendar_retry(item, delay)
+        else:
+            log.error(
+                f"[{item.fonte_nome}] Arquivo instável após 5 tentativas: {path.name}. O arquivo será recuperado na próxima varredura periódica."
+            )
+        return
+
+    # 3. Hash do arquivo (reutiliza cache se disponível)
+    h = cached_hash if cached_hash else compute_file_hash(path)
+
+    # 4. Verifica se hash já foi enviado anteriormente
+    if is_hash_uploaded(DB_PATH, h):
+        update_stat_cache(DB_PATH, path, h)
+        return
+
+    # 5. Extração polimórfica das informações fiscais
+    info = extract_fiscal_info(path, usar_destinatario=(item.tipo == "entrada"))
     if info is None:
         log.info(f"[{item.fonte_nome}] Ignorado (XML não reconhecido): {path.name}")
         return
 
-    cnpj, ano, mes, data_emissao = info
-    if data_emissao < item.data_inicio:
+    # 6. Filtro por data de corte
+    if info.data_emissao < item.data_inicio:
         return
 
+    # 7. Upload para o Cloudflare R2 com retry exponencial em caso de falha de rede
     try:
-        object_key = upload_xml(client, path, cnpj, ano, mes, item.tipo)
-        register_upload(h, path.name, cnpj, ano, mes, object_key)
+        object_key = upload_xml(client, path, info.cnpj, info.ano, info.mes, item.tipo)
+        register_upload(DB_PATH, h, path.name, info.cnpj, info.ano, info.mes, object_key)
+        update_stat_cache(DB_PATH, path, h)
+        stats.registrar_envio()
         log.info(f"[{item.fonte_nome}] Enviado: {path.name} -> {object_key}")
-    except ClientError as e:
-        log.error(f"[{item.fonte_nome}] Falha ao enviar {path.name}: {e}")
     except Exception as e:
-        log.error(f"[{item.fonte_nome}] Falha inesperada ao enviar {path.name}: {e}")
+        stats.registrar_erro(f"{path.name}: {e}")
+        if item.tentativas < 5:
+            item.tentativas += 1
+            delay = min(60, 2 ** item.tentativas)
+            log.warning(
+                f"[{item.fonte_nome}] [Tentativa {item.tentativas}/5] Falha de rede para {path.name}: {e}. Reagendando em {delay}s..."
+            )
+            agendar_retry(item, delay)
+        else:
+            log.error(
+                f"[{item.fonte_nome}] Falha persistente de rede para {path.name} após 5 tentativas: {e}. O arquivo será recuperado na próxima varredura periódica."
+            )
 
 
 # ------------------------------------------------------------------
-# WATCHDOG — um handler por fonte, cada um sabendo sua própria data_inicio
+# WATCHDOG — Captura created, moved e modified por pasta monitorada
 # ------------------------------------------------------------------
 
 class FonteXMLHandler(FileSystemEventHandler):
@@ -339,22 +498,59 @@ class FonteXMLHandler(FileSystemEventHandler):
         self.tipo = tipo
 
     def on_created(self, event):
-        if not event.is_directory:
+        if not event.is_directory and event.src_path.lower().endswith(".xml"):
             fila_arquivos.put(ItemFila(Path(event.src_path), self.data_inicio, self.fonte_nome, self.tipo))
 
     def on_moved(self, event):
-        if not event.is_directory:
+        if not event.is_directory and event.dest_path.lower().endswith(".xml"):
             fila_arquivos.put(ItemFila(Path(event.dest_path), self.data_inicio, self.fonte_nome, self.tipo))
+
+    def on_modified(self, event):
+        if not event.is_directory and event.src_path.lower().endswith(".xml"):
+            fila_arquivos.put(ItemFila(Path(event.src_path), self.data_inicio, self.fonte_nome, self.tipo))
+
+
+# ------------------------------------------------------------------
+# VARREDURA INICIAL & RECONCILIAÇÃO PERIÓDICA
+# ------------------------------------------------------------------
+
+def varredura_reconciliacao(fontes=None, db_path=None) -> int:
+    target_fontes = FONTES if fontes is None else fontes
+    target_db = DB_PATH if db_path is None else db_path
+    total = 0
+    for fonte in target_fontes:
+        pasta = Path(fonte["pasta"])
+        if not pasta.exists():
+            continue
+        for xml_path in pasta.rglob("*.xml"):
+            is_up, _ = check_stat_cache(target_db, xml_path)
+            if is_up:
+                continue
+            fila_arquivos.put(ItemFila(xml_path, fonte["data_inicio"], fonte["nome"], fonte.get("tipo", "saida")))
+            total += 1
+    return total
 
 
 def varredura_inicial():
     log.info("Fazendo varredura inicial das pastas configuradas...")
-    total = 0
-    for fonte in FONTES:
-        for xml_path in fonte["pasta"].rglob("*.xml"):
-            fila_arquivos.put(ItemFila(xml_path, fonte["data_inicio"], fonte["nome"], fonte["tipo"]))
-            total += 1
+    total = varredura_reconciliacao()
     log.info(f"{total} arquivos enfileirados na varredura inicial.")
+
+
+def reconciliation_loop(intervalo: int = 1800, stop_event: Optional[threading.Event] = None):
+    log.info(f"Loop de reconciliação periódico iniciado (intervalo={intervalo}s).")
+    while stop_event is None or not stop_event.is_set():
+        if stop_event:
+            if stop_event.wait(intervalo):
+                break
+        else:
+            time.sleep(intervalo)
+        try:
+            total = varredura_reconciliacao()
+            if total > 0:
+                log.info(f"[Reconciliação] {total} arquivo(s) não sincronizado(s) reenfileirado(s).")
+        except Exception as e:
+            log.error(f"[Reconciliação] Erro durante varredura: {e}")
 
 
 # ------------------------------------------------------------------
@@ -363,7 +559,7 @@ def varredura_inicial():
 
 def main():
     carregar_config()
-    init_db()
+    init_db(DB_PATH)
 
     log.info("Conectando ao Cloudflare R2...")
     client = build_r2_client()
@@ -379,7 +575,14 @@ def main():
         t = threading.Thread(target=worker_loop, args=(client,), name=f"worker-{i}", daemon=True)
         t.start()
 
+    if HEARTBEAT_MIN > 0:
+        t_hb = threading.Thread(target=heartbeat_loop, args=(client,), name="heartbeat", daemon=True)
+        t_hb.start()
+
     varredura_inicial()
+
+    t_rec = threading.Thread(target=reconciliation_loop, name="reconciliation", daemon=True)
+    t_rec.start()
 
     observer = Observer()
     for fonte in FONTES:
@@ -390,7 +593,7 @@ def main():
                  f"(desde {fonte['data_inicio'].strftime('%d/%m/%Y')}, tipo: {tipo_label})")
 
     observer.start()
-    log.info(f"Robocop rodando com {NUM_WORKERS} workers, {len(FONTES)} pasta(s) monitorada(s).")
+    log.info(f"Robocop v{VERSAO} [{NOME_CLIENTE}] rodando com {NUM_WORKERS} workers, {len(FONTES)} pasta(s) monitorada(s).")
 
     try:
         while True:

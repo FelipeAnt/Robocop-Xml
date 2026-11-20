@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal enabledelayedexpansion
 
 :: ==================================================================
 :: build_exe.bat
@@ -23,6 +23,23 @@ where python >nul 2>&1
 if %errorLevel% neq 0 (
     echo [ERRO] Python nao encontrado. Rode este build numa maquina com
     echo Python instalado ^(so aqui no build, nao precisa no cliente^).
+    pause
+    exit /b 1
+)
+
+:: --- Confere se os modulos locais estao presentes antes de comecar ---
+:: robocop_clone.py importa db_manager, fiscal_parser, stability e segredo. O
+:: PyInstaller detecta e empacota esses modulos sozinho (sao so biblioteca
+:: padrao por dentro), mas so se os .py estiverem fisicamente aqui do lado.
+set "FALTANDO="
+for %%F in (robocop_clone.py configurador.py db_manager.py fiscal_parser.py stability.py segredo.py requirements.txt) do (
+    if not exist "%%F" set "FALTANDO=!FALTANDO! %%F"
+)
+if defined FALTANDO (
+    echo [ERRO] Arquivo^(s^) faltando nesta pasta: %FALTANDO%
+    echo Todos os modulos ^(robocop_clone.py, configurador.py, db_manager.py,
+    echo fiscal_parser.py, stability.py, segredo.py^) e o requirements.txt precisam estar
+    echo juntos, na mesma pasta, antes de rodar o build.
     pause
     exit /b 1
 )
@@ -59,7 +76,7 @@ mkdir pacote_cliente
 xcopy /E /I /Y dist\robocop_clone\* pacote_cliente\ >nul
 xcopy /E /I /Y dist\configurador\* pacote_cliente\ >nul
 
-for %%F in (instalar_servico.bat desinstalar_servico.bat travar_pasta.bat) do (
+for %%F in (instalar_servico.bat desinstalar_servico.bat) do (
     if exist "%%F" (
         copy /Y "%%F" pacote_cliente\ >nul
     ) else (
@@ -73,7 +90,7 @@ echo  Build concluido.
 echo.
 echo  Pacote pronto para o cliente em: pacote_cliente\
 echo    - robocop_clone.exe + configurador.exe
-echo    - instalar_servico.bat / desinstalar_servico.bat / travar_pasta.bat
+echo    - instalar_servico.bat / desinstalar_servico.bat
 echo.
 echo  Copie a pasta "pacote_cliente" inteira para a maquina do cliente,
 echo  rode configurador.exe la para gerar o config.json daquele cliente,
