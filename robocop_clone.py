@@ -3,7 +3,7 @@ robocop_clone.py (v7.1 - Cloudflare R2, Resiliência e Integridade Fiscal)
 -----------------------------------------------------------------------
 Monitora N pastas locais (NFC-e, NF-e, ou qualquer outra fonte de XML fiscal),
 cada uma com sua própria data de início, identifica CNPJ / ano / mês pelo
-conteúdo do XML com suporte a NF-e, NFC-e, Eventos/Cancelamentos e Inutilizações.
+conteúdo do XML (NF-e, NFC-e e eventos de cancelamento homologados).
 
 Recursos de Resiliência:
 - Memória local em SQLite com cache de stat (file_stat_cache) para varreduras rápidas.
@@ -50,7 +50,7 @@ from db_manager import (
 )
 import fiscal_parser
 import segredo
-from fiscal_parser import extract_fiscal_info, FiscalDocInfo
+from fiscal_parser import extract_fiscal_info, extract_cancelamento_info, FiscalDocInfo
 import stability
 from stability import esperar_arquivo_estavel
 
@@ -255,8 +255,9 @@ def build_r2_client():
     )
 
 
-def upload_xml(client, local_path: Path, cnpj: str, ano: str, mes: str, tipo: str) -> str:
-    object_key = f"{ano}/{mes}/{cnpj}/{tipo}/{local_path.name}"
+def upload_xml(client, local_path: Path, cnpj: str, ano: str, mes: str, tipo: str,
+               nome_objeto: Optional[str] = None) -> str:
+    object_key = f"{ano}/{mes}/{cnpj}/{tipo}/{nome_objeto or local_path.name}"
     client.upload_file(
         str(local_path),
         R2_BUCKET,
@@ -482,6 +483,9 @@ def processar_arquivo(item: ItemFila, client):
 
     # 5. Extração polimórfica das informações fiscais
     info = extract_fiscal_info(path, usar_destinatario=(item.tipo == "entrada"))
+    if info is None and item.tipo == "saida":
+        # Cancelamentos só em pastas de saída (o evento traz o CNPJ do emitente)
+        info = extract_cancelamento_info(path)
     if info is None:
         log.info(f"[{item.fonte_nome}] Ignorado (XML não reconhecido): {path.name}")
         register_ignored(DB_PATH, path, MOTIVO_NAO_RECONHECIDO)
@@ -494,7 +498,12 @@ def processar_arquivo(item: ItemFila, client):
 
     # 7. Upload para o Cloudflare R2 com retry exponencial em caso de falha de rede
     try:
-        object_key = upload_xml(client, path, info.cnpj, info.ano, info.mes, item.tipo)
+        if info.doc_tipo == "cancelamento":
+            # Pasta própria e nome pela chave: sem colisão e fácil de localizar
+            object_key = upload_xml(client, path, info.cnpj, info.ano, info.mes,
+                                    "cancelamento", f"{info.chave}-cancelamento.xml")
+        else:
+            object_key = upload_xml(client, path, info.cnpj, info.ano, info.mes, item.tipo)
         register_upload(DB_PATH, h, path.name, info.cnpj, info.ano, info.mes, object_key)
         update_stat_cache(DB_PATH, path, h)
         stats.registrar_envio()
