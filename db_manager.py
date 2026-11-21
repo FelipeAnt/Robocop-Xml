@@ -106,6 +106,18 @@ def init_db(db_path: str):
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_stat_hash ON file_stat_cache(file_hash)"
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ignored_files (
+            file_path TEXT PRIMARY KEY,
+            file_size INTEGER,
+            mtime REAL,
+            motivo TEXT,
+            data_emissao TEXT,
+            ignorado_em TEXT
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -203,3 +215,73 @@ def contar_uploads(db_path: str) -> int:
     """Total de arquivos já registrados como enviados."""
     conn = get_conn(db_path)
     return conn.execute("SELECT COUNT(*) FROM uploads").fetchone()[0]
+
+
+MOTIVO_DATA = "data"                      # emitido antes da data de início da fonte
+MOTIVO_NAO_RECONHECIDO = "nao_reconhecido"  # não é NF-e/NFC-e (evento, lixo, etc.)
+
+
+def _stat_arquivo(path: Path):
+    try:
+        resolved = Path(path).resolve()
+        st = resolved.stat()
+        return str(resolved), st.st_size, st.st_mtime
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+
+
+def register_ignored(db_path: str, path: Path, motivo: str, data_emissao: Optional[datetime] = None):
+    """Memoriza um XML que não deve ser enviado, para não relê-lo/reparseá-lo a
+    cada varredura. Vale enquanto tamanho e mtime do arquivo não mudarem."""
+    info = _stat_arquivo(path)
+    if info is None:
+        return
+    path_str, size, mtime = info
+    conn = get_conn(db_path)
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO ignored_files (file_path, file_size, mtime, motivo, data_emissao, ignorado_em)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            path_str, size, mtime, motivo,
+            data_emissao.strftime("%Y-%m-%d") if data_emissao else None,
+            datetime.now().isoformat(),
+        ),
+    )
+    conn.commit()
+
+
+def is_ignored(db_path: str, path: Path, data_inicio: Optional[datetime] = None) -> bool:
+    """True se o arquivo (mesmo tamanho/mtime) já foi descartado antes.
+
+    Descarte por data só vale enquanto a data de emissão continuar anterior à
+    data de início da fonte — se você recuar a data de início no configurador,
+    esses arquivos voltam a ser considerados automaticamente."""
+    info = _stat_arquivo(path)
+    if info is None:
+        return False
+    path_str, size, mtime = info
+    conn = get_conn(db_path)
+    row = conn.execute(
+        "SELECT file_size, mtime, motivo, data_emissao FROM ignored_files WHERE file_path = ?",
+        (path_str,),
+    ).fetchone()
+    if not row:
+        return False
+    r_size, r_mtime, motivo, r_data = row
+    if r_size != size or abs(r_mtime - mtime) >= 0.001:
+        return False
+    if motivo == MOTIVO_DATA:
+        if data_inicio is None or not r_data:
+            return False
+        try:
+            return datetime.strptime(r_data, "%Y-%m-%d") < data_inicio
+        except ValueError:
+            return False
+    return True
+
+
+def contar_ignorados(db_path: str) -> int:
+    conn = get_conn(db_path)
+    return conn.execute("SELECT COUNT(*) FROM ignored_files").fetchone()[0]

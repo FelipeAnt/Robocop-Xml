@@ -9,31 +9,40 @@ def esperar_arquivo_estavel(
     intervalo: float = 0.5,
 ) -> bool:
     """
-    Verifica se o arquivo existe, tem tamanho > 0, permite abertura em leitura
-    (sem locks exclusivos pelo ERP) e mantém tamanho estável.
-    Retorna True se estiver 100% pronto. Retorna False caso contrário (para reenfileiramento).
+    Retorna True quando o arquivo está pronto para ser lido: existe, não está
+    vazio, abre em leitura (sem lock exclusivo do ERP) e mantém tamanho E data
+    de modificação idênticos em duas leituras consecutivas.
+
+    Problemas transitórios (arquivo travado pelo ERP/antivírus, ainda vazio) não
+    encerram a verificação: gastam uma tentativa e a checagem segue. Só devolve
+    False de imediato se o arquivo sumiu ou não é um arquivo.
+
+    Retorna False se esgotar as tentativas (o chamador reagenda com backoff).
     """
     path = Path(path)
-    if not path.exists() or not path.is_file():
-        return False
+    anterior = None  # (tamanho, mtime_ns) da última leitura boa
 
-    tamanho_anterior = -1
-    for _ in range(tentativas):
+    for i in range(tentativas):
+        atual = None
         try:
-            # Testa abertura e lock exclusivo do Windows
+            if not path.is_file():
+                return False
+            # Testa abertura (detecta lock exclusivo do Windows)
             with open(path, "rb") as f:
                 f.read(10)
-            tamanho_atual = path.stat().st_size
-        except (PermissionError, FileNotFoundError, OSError):
-            return False
+            st = path.stat()
+            if st.st_size > 0:
+                atual = (st.st_size, st.st_mtime_ns)
+        except FileNotFoundError:
+            return False  # sumiu (renomeado/removido): não adianta esperar
+        except OSError:
+            pass  # PermissionError e afins: lock transitório, tenta de novo
 
-        if tamanho_atual == 0:
-            return False
-
-        if tamanho_atual == tamanho_anterior:
+        if atual is not None and atual == anterior:
             return True
+        anterior = atual  # None (lock/vazio) zera a comparação
 
-        tamanho_anterior = tamanho_atual
-        time.sleep(intervalo)
+        if i < tentativas - 1:  # não dorme depois da última tentativa
+            time.sleep(intervalo)
 
     return False

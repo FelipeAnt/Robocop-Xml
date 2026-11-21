@@ -43,6 +43,10 @@ from db_manager import (
     compute_file_hash,
     check_stat_cache,
     update_stat_cache,
+    is_ignored,
+    register_ignored,
+    MOTIVO_DATA,
+    MOTIVO_NAO_RECONHECIDO,
 )
 import fiscal_parser
 import segredo
@@ -63,6 +67,10 @@ CONFIG_FILE = str(BASE_DIR / "config.json")
 DB_PATH = str(BASE_DIR / "controle_upload.sqlite3")
 LOG_FILE = str(BASE_DIR / "robocop_clone.log")
 QUEUE_MAXSIZE = 50000
+# Limites de retry independentes: instabilidade do arquivo (ERP ainda gravando)
+# e falha de rede/R2 são problemas diferentes e não devem dividir a mesma conta.
+MAX_TENTATIVAS_ESTABILIDADE = 5
+MAX_TENTATIVAS_REDE = 5
 VERSAO = "7.1"
 
 # Preenchidos em main() a partir do config.json
@@ -398,7 +406,8 @@ class ItemFila:
     data_inicio: datetime
     fonte_nome: str
     tipo: str = "saida"
-    tentativas: int = 0
+    tentativas_estabilidade: int = 0
+    tentativas_rede: int = 0
 
 
 fila_arquivos: "queue.Queue[ItemFila]" = queue.Queue(maxsize=QUEUE_MAXSIZE)
@@ -409,6 +418,23 @@ def agendar_retry(item: "ItemFila", delay: float):
     o worker nem segurar um get() em aberto — evita corromper a contagem
     interna de tarefas pendentes da Queue."""
     threading.Timer(delay, fila_arquivos.put, args=(item,)).start()
+
+
+def reagendar(item: "ItemFila", campo: str, limite: int, motivo: str) -> bool:
+    """Incrementa o contador 'campo' do item e agenda novo retry com backoff
+    exponencial (teto de 60s). Retorna False quando o limite já foi atingido."""
+    n = getattr(item, campo)
+    if n >= limite:
+        return False
+    n += 1
+    setattr(item, campo, n)
+    delay = min(60, 2 ** n)
+    log.warning(
+        f"[{item.fonte_nome}] [Tentativa {n}/{limite}] {motivo}: {item.path.name}. "
+        f"Reagendando em {delay}s..."
+    )
+    agendar_retry(item, delay)
+    return True
 
 
 def worker_loop(client):
@@ -432,18 +458,17 @@ def processar_arquivo(item: ItemFila, client):
     if is_up:
         return
 
+    # 1b. Já foi descartado antes (fora da data de início ou XML não reconhecido)?
+    if is_ignored(DB_PATH, path, item.data_inicio):
+        return
+
     # 2. Verificação de estabilidade do arquivo
     if not esperar_arquivo_estavel(path, tentativas=3, intervalo=0.5):
-        if item.tentativas < 5:
-            item.tentativas += 1
-            delay = min(60, 2 ** item.tentativas)
-            log.warning(
-                f"[{item.fonte_nome}] [Tentativa {item.tentativas}/5] Arquivo instável ou em gravação: {path.name}. Reenfileirando em {delay}s..."
-            )
-            agendar_retry(item, delay)
-        else:
+        if not reagendar(item, "tentativas_estabilidade", MAX_TENTATIVAS_ESTABILIDADE,
+                         "Arquivo instável ou em gravação"):
             log.error(
-                f"[{item.fonte_nome}] Arquivo instável após 5 tentativas: {path.name}. O arquivo será recuperado na próxima varredura periódica."
+                f"[{item.fonte_nome}] Arquivo instável após {MAX_TENTATIVAS_ESTABILIDADE} tentativas: "
+                f"{path.name}. O arquivo será recuperado na próxima varredura periódica."
             )
         return
 
@@ -459,10 +484,12 @@ def processar_arquivo(item: ItemFila, client):
     info = extract_fiscal_info(path, usar_destinatario=(item.tipo == "entrada"))
     if info is None:
         log.info(f"[{item.fonte_nome}] Ignorado (XML não reconhecido): {path.name}")
+        register_ignored(DB_PATH, path, MOTIVO_NAO_RECONHECIDO)
         return
 
     # 6. Filtro por data de corte
     if info.data_emissao < item.data_inicio:
+        register_ignored(DB_PATH, path, MOTIVO_DATA, info.data_emissao)
         return
 
     # 7. Upload para o Cloudflare R2 com retry exponencial em caso de falha de rede
@@ -474,16 +501,10 @@ def processar_arquivo(item: ItemFila, client):
         log.info(f"[{item.fonte_nome}] Enviado: {path.name} -> {object_key}")
     except Exception as e:
         stats.registrar_erro(f"{path.name}: {e}")
-        if item.tentativas < 5:
-            item.tentativas += 1
-            delay = min(60, 2 ** item.tentativas)
-            log.warning(
-                f"[{item.fonte_nome}] [Tentativa {item.tentativas}/5] Falha de rede para {path.name}: {e}. Reagendando em {delay}s..."
-            )
-            agendar_retry(item, delay)
-        else:
+        if not reagendar(item, "tentativas_rede", MAX_TENTATIVAS_REDE, f"Falha de rede ({e})"):
             log.error(
-                f"[{item.fonte_nome}] Falha persistente de rede para {path.name} após 5 tentativas: {e}. O arquivo será recuperado na próxima varredura periódica."
+                f"[{item.fonte_nome}] Falha persistente de rede para {path.name} após "
+                f"{MAX_TENTATIVAS_REDE} tentativas: {e}. O arquivo será recuperado na próxima varredura periódica."
             )
 
 
@@ -525,6 +546,8 @@ def varredura_reconciliacao(fontes=None, db_path=None) -> int:
         for xml_path in pasta.rglob("*.xml"):
             is_up, _ = check_stat_cache(target_db, xml_path)
             if is_up:
+                continue
+            if is_ignored(target_db, xml_path, fonte["data_inicio"]):
                 continue
             fila_arquivos.put(ItemFila(xml_path, fonte["data_inicio"], fonte["nome"], fonte.get("tipo", "saida")))
             total += 1
