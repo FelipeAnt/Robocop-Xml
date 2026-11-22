@@ -105,6 +105,8 @@ def classificar(payload, last_modified, agora, limite_horas: float):
     if payload is None:
         alertas.append("heartbeat ilegível")
     else:
+        if p.get("credencial_invalida"):
+            alertas.append("CREDENCIAL R2 RECUSADA")
         if (p.get("erros_consecutivos") or 0) >= 3:
             alertas.append(f"{p['erros_consecutivos']} erros seguidos")
         if (p.get("workers_vivos") or 0) < (p.get("workers_esperados") or 0):

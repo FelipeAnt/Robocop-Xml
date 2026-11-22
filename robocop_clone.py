@@ -1,5 +1,5 @@
 """
-robocop_clone.py (v7.1 - Cloudflare R2, Resiliência e Integridade Fiscal)
+robocop_clone.py (v7.2 - Cloudflare R2, Resiliência e Integridade Fiscal)
 -----------------------------------------------------------------------
 Monitora N pastas locais (NFC-e, NF-e, ou qualquer outra fonte de XML fiscal),
 cada uma com sua própria data de início, identifica CNPJ / ano / mês pelo
@@ -10,6 +10,8 @@ Recursos de Resiliência:
 - Verificação robusta de integridade de arquivo antes de processar (stability).
 - Rotação de logs com RotatingFileHandler (10MB, 3 backups).
 - Retry com backoff exponencial para falhas temporárias de rede.
+- Token revogado/sem permissão (401/403): para de tentar, avisa no log/heartbeat e reinicia
+  sozinho (como serviço) para reler o config.json.
 - Varredura periódica de reconciliação (daemon) a cada 30 minutos.
 - Heartbeat periódico (_status/<cliente>.json no R2) para monitorar PCs remotamente.
 - Watchdog capturando eventos de criação, renomeação e modificação (on_created, on_moved, on_modified).
@@ -23,7 +25,6 @@ import queue
 import re
 import shutil
 import socket
-import sqlite3
 import sys
 import threading
 import time
@@ -41,6 +42,8 @@ from watchdog.observers import Observer
 import db_manager
 from db_manager import (
     compute_file_hash,
+    is_hash_uploaded,
+    register_upload,
     check_stat_cache,
     update_stat_cache,
     is_ignored,
@@ -48,10 +51,8 @@ from db_manager import (
     MOTIVO_DATA,
     MOTIVO_NAO_RECONHECIDO,
 )
-import fiscal_parser
 import segredo
-from fiscal_parser import extract_fiscal_info, extract_documento, FiscalDocInfo
-import stability
+from fiscal_parser import extract_documento
 from stability import esperar_arquivo_estavel
 
 # ------------------------------------------------------------------
@@ -71,7 +72,7 @@ QUEUE_MAXSIZE = 50000
 # e falha de rede/R2 são problemas diferentes e não devem dividir a mesma conta.
 MAX_TENTATIVAS_ESTABILIDADE = 5
 MAX_TENTATIVAS_REDE = 5
-VERSAO = "7.1"
+VERSAO = "7.2"
 
 # Preenchidos em main() a partir do config.json
 R2_ACCOUNT_ID = ""
@@ -83,8 +84,6 @@ NOME_CLIENTE = ""
 EXIGIR_PROTOCOLO = True  # só envia nota com protocolo cStat 100/150 (config: exigir_protocolo)
 HEARTBEAT_MIN = 15  # 0 desliga o heartbeat
 FONTES = []  # lista de dicts {"pasta": ..., "data_inicio": datetime, "nome": ..., "tipo": ...}
-
-NFE_NS = {"nfe": "http://www.portalfiscal.inf.br/nfe"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -136,8 +135,7 @@ def falha_fatal(titulo: str, problemas):
     for p in ([problemas] if isinstance(problemas, str) else problemas):
         log.error(f"  - {p}")
     log.error("Corrija com o configurador.py (ou editando o config.json) e reinicie o serviço.")
-    interativo = bool(sys.stdin) and sys.stdin.isatty()
-    if not interativo:
+    if not _interativo():
         log.error(f"Aguardando {ESPERA_ERRO_FATAL_SERVICO}s antes de encerrar (evita reinício em loop).")
         time.sleep(ESPERA_ERRO_FATAL_SERVICO)
     sys.exit(1)
@@ -295,47 +293,6 @@ def carregar_config():
 
 
 # ------------------------------------------------------------------
-# BANCO LOCAL & COMPATIBILIDADE RETROATIVA (delegado a db_manager)
-# ------------------------------------------------------------------
-
-def init_db(db_path: Optional[str] = None):
-    target = db_path or DB_PATH
-    db_manager.init_db(target)
-
-
-def is_hash_uploaded(*args, **kwargs) -> bool:
-    if len(args) == 1 and isinstance(args[0], str):
-        return db_manager.is_hash_uploaded(DB_PATH, args[0])
-    return db_manager.is_hash_uploaded(*args, **kwargs)
-
-
-already_uploaded = is_hash_uploaded
-file_hash = compute_file_hash
-
-
-def register_upload(*args, **kwargs):
-    if len(args) == 6:
-        return db_manager.register_upload(DB_PATH, *args, **kwargs)
-    return db_manager.register_upload(*args, **kwargs)
-
-
-def get_conn(db_path: Optional[str] = None) -> sqlite3.Connection:
-    target = db_path or DB_PATH
-    return db_manager.get_conn(target)
-
-
-def close_conn(db_path: Optional[str] = None):
-    target = db_path or DB_PATH
-    db_manager.close_conn(target)
-
-
-def extract_nfce_info(xml_path: Path, usar_destinatario: bool = False):
-    info = extract_fiscal_info(xml_path, usar_destinatario=usar_destinatario)
-    if info is None:
-        return None
-    return info.cnpj, info.ano, info.mes, info.data_emissao
-
-
 # ------------------------------------------------------------------
 # CLOUDFLARE R2 (compatível com S3)
 # ------------------------------------------------------------------
@@ -350,6 +307,21 @@ def build_r2_client():
         region_name="auto",
         config=BotoConfig(retries={"max_attempts": 8, "mode": "adaptive"}),
     )
+
+
+# Respostas do R2 que indicam credencial revogada/expirada/sem permissão ou bucket
+# errado: repetir o mesmo upload não adianta, só o config.json corrigido resolve.
+CODIGOS_CREDENCIAL = {"401", "403", "AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch",
+                      "ExpiredToken", "InvalidToken", "NoSuchBucket"}
+
+
+def erro_credencial(exc: Exception) -> bool:
+    if not isinstance(exc, ClientError):
+        return False
+    resp = getattr(exc, "response", None) or {}
+    codigo = str(resp.get("Error", {}).get("Code", ""))
+    http = str(resp.get("ResponseMetadata", {}).get("HTTPStatusCode", ""))
+    return codigo in CODIGOS_CREDENCIAL or http in ("401", "403")
 
 
 def upload_xml(client, local_path: Path, cnpj: str, ano: str, mes: str, tipo: str,
@@ -379,6 +351,7 @@ class Estatisticas:
         self.erros_consecutivos = 0
         self.ultimo_erro = None
         self.ultimo_erro_em = None
+        self.credencial_invalida_desde = None  # datetime quando o R2 recusou a credencial
 
     def registrar_envio(self):
         with self._lock:
@@ -392,6 +365,23 @@ class Estatisticas:
             self.ultimo_erro = msg[:300]
             self.ultimo_erro_em = datetime.now()
 
+    def marcar_credencial_invalida(self) -> bool:
+        """True só na PRIMEIRA vez (quem chama loga o aviso uma única vez)."""
+        with self._lock:
+            if self.credencial_invalida_desde is None:
+                self.credencial_invalida_desde = datetime.now()
+                return True
+            return False
+
+    def limpar_credencial_invalida(self):
+        with self._lock:
+            self.credencial_invalida_desde = None
+            self.erros_consecutivos = 0
+
+    @property
+    def credencial_invalida(self) -> bool:
+        return self.credencial_invalida_desde is not None
+
     def snapshot(self) -> dict:
         with self._lock:
             return {
@@ -401,6 +391,7 @@ class Estatisticas:
                 "erros_consecutivos": self.erros_consecutivos,
                 "ultimo_erro": self.ultimo_erro,
                 "ultimo_erro_em": self.ultimo_erro_em,
+                "credencial_invalida_desde": self.credencial_invalida_desde,
             }
 
 
@@ -433,6 +424,10 @@ def montar_heartbeat() -> dict:
     except Exception:
         total_db = None
     try:
+        ignorados_db = db_manager.contar_ignorados(DB_PATH)
+    except Exception:
+        ignorados_db = None
+    try:
         disco_livre_mb = shutil.disk_usage(str(BASE_DIR)).free // (1024 * 1024)
     except Exception:
         disco_livre_mb = None
@@ -449,10 +444,13 @@ def montar_heartbeat() -> dict:
         "workers_vivos": workers_vivos,
         "enviados_sessao": snap["enviados_sessao"],
         "total_enviados_db": total_db,
+        "total_ignorados_db": ignorados_db,
         "ultimo_envio_em": _iso(snap["ultimo_envio_em"]),
         "erros_consecutivos": snap["erros_consecutivos"],
         "ultimo_erro": snap["ultimo_erro"],
         "ultimo_erro_em": _iso(snap["ultimo_erro_em"]),
+        "credencial_invalida": snap["credencial_invalida_desde"] is not None,
+        "credencial_invalida_desde": _iso(snap["credencial_invalida_desde"]),
         "disco_livre_mb": disco_livre_mb,
         "fontes": [
             {"nome": f["nome"], "pasta": str(f["pasta"]), "tipo": f["tipo"],
@@ -551,6 +549,11 @@ def processar_arquivo(item: ItemFila, client):
     if not path.exists() or path.suffix.lower() != ".xml":
         return
 
+    # 0. Credencial recusada pelo R2: não gasta CPU/retries; o arquivo continua na
+    # pasta e é reenfileirado pela reconciliação quando o acesso voltar.
+    if stats.credencial_invalida:
+        return
+
     # 1. Fast-check no cache de stat (evita ler disco e calcular hash se já enviado)
     is_up, cached_hash = check_stat_cache(DB_PATH, path)
     if is_up:
@@ -612,6 +615,14 @@ def processar_arquivo(item: ItemFila, client):
         log.info(f"[{item.fonte_nome}] Enviado: {path.name} -> {object_key}")
     except Exception as e:
         stats.registrar_erro(f"{path.name}: {e}")
+        if erro_credencial(e):
+            if stats.marcar_credencial_invalida():
+                log.error(
+                    "O R2 RECUSOU A CREDENCIAL (token revogado, expirado ou sem permissão): "
+                    f"{e}. Pausando os envios (sem retry). Gere um novo token no Cloudflare e "
+                    "refaça no configurador.py; o robô tenta de novo sozinho."
+                )
+            return
         if not reagendar(item, "tentativas_rede", MAX_TENTATIVAS_REDE, f"Falha de rede ({e})"):
             log.error(
                 f"[{item.fonte_nome}] Falha persistente de rede para {path.name} após "
@@ -688,6 +699,57 @@ def reconciliation_loop(intervalo: int = 1800, stop_event: Optional[threading.Ev
 
 
 # ------------------------------------------------------------------
+# VIGIA DE CREDENCIAL — após 401/403 o robô pausa e re-tenta periodicamente
+# ------------------------------------------------------------------
+
+VIGIA_INTERVALO_S = 60
+REINICIAR_APOS_S = 600  # 10 min bloqueado: reinicia para reler o config.json
+
+
+def _interativo() -> bool:
+    return bool(sys.stdin) and sys.stdin.isatty()
+
+
+def vigia_credencial_passo(client) -> str:
+    """Um ciclo do vigia. Devolve: 'ok' (não estava bloqueado), 'recuperou',
+    'bloqueado' ou 'reiniciar'."""
+    desde = stats.credencial_invalida_desde
+    if desde is None:
+        return "ok"
+    try:
+        client.head_bucket(Bucket=R2_BUCKET)
+    except Exception as e:
+        if not erro_credencial(e):
+            return "bloqueado"  # rede fora do ar: segue esperando
+        if (datetime.now() - desde).total_seconds() >= REINICIAR_APOS_S and not _interativo():
+            return "reiniciar"
+        return "bloqueado"
+    stats.limpar_credencial_invalida()
+    total = varredura_reconciliacao()
+    log.info(f"Acesso ao R2 restabelecido. Retomando envios ({total} arquivo(s) reenfileirado(s)).")
+    return "recuperou"
+
+
+def vigia_credencial_loop(client, stop_event: Optional[threading.Event] = None):
+    while True:
+        try:
+            if vigia_credencial_passo(client) == "reiniciar":
+                log.error(
+                    "Credencial do R2 continua recusada há 10 min. Encerrando para o serviço "
+                    "reiniciar e reler o config.json (se você já corrigiu, volta a funcionar)."
+                )
+                logging.shutdown()
+                os._exit(1)
+        except Exception as e:
+            log.error(f"[Vigia] erro inesperado: {e}")
+        if stop_event is not None:
+            if stop_event.wait(VIGIA_INTERVALO_S):
+                break
+        else:
+            time.sleep(VIGIA_INTERVALO_S)
+
+
+# ------------------------------------------------------------------
 # MAIN
 # ------------------------------------------------------------------
 
@@ -728,7 +790,7 @@ def main():
         carregar_config()
     except ConfigError as e:
         falha_fatal("Erro de configuração", e.problemas)
-    init_db(DB_PATH)
+    db_manager.init_db(DB_PATH)
 
     log.info("Conectando ao Cloudflare R2...")
     client = conectar_r2()
@@ -736,6 +798,8 @@ def main():
     for i in range(NUM_WORKERS):
         t = threading.Thread(target=worker_loop, args=(client,), name=f"worker-{i}", daemon=True)
         t.start()
+
+    threading.Thread(target=vigia_credencial_loop, args=(client,), name="vigia", daemon=True).start()
 
     if HEARTBEAT_MIN > 0:
         t_hb = threading.Thread(target=heartbeat_loop, args=(client,), name="heartbeat", daemon=True)
