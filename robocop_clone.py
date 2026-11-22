@@ -3,7 +3,7 @@ robocop_clone.py (v7.1 - Cloudflare R2, Resiliência e Integridade Fiscal)
 -----------------------------------------------------------------------
 Monitora N pastas locais (NFC-e, NF-e, ou qualquer outra fonte de XML fiscal),
 cada uma com sua própria data de início, identifica CNPJ / ano / mês pelo
-conteúdo do XML (NF-e, NFC-e e eventos de cancelamento homologados).
+conteúdo do XML (NF-e/NFC-e autorizadas, cancelamentos e inutilizações homologados).
 
 Recursos de Resiliência:
 - Memória local em SQLite com cache de stat (file_stat_cache) para varreduras rápidas.
@@ -50,7 +50,7 @@ from db_manager import (
 )
 import fiscal_parser
 import segredo
-from fiscal_parser import extract_fiscal_info, extract_cancelamento_info, FiscalDocInfo
+from fiscal_parser import extract_fiscal_info, extract_documento, FiscalDocInfo
 import stability
 from stability import esperar_arquivo_estavel
 
@@ -80,6 +80,7 @@ R2_SECRET_ACCESS_KEY = ""
 R2_BUCKET = ""
 NUM_WORKERS = 4
 NOME_CLIENTE = ""
+EXIGIR_PROTOCOLO = True  # só envia nota com protocolo cStat 100/150 (config: exigir_protocolo)
 HEARTBEAT_MIN = 15  # 0 desliga o heartbeat
 FONTES = []  # lista de dicts {"pasta": ..., "data_inicio": datetime, "nome": ..., "tipo": ...}
 
@@ -117,7 +118,7 @@ def migrar_segredo(cfg: dict, secret_puro: str):
 
 def carregar_config():
     global R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, NUM_WORKERS, FONTES
-    global NOME_CLIENTE, HEARTBEAT_MIN
+    global NOME_CLIENTE, HEARTBEAT_MIN, EXIGIR_PROTOCOLO
 
     cfg_path = Path(CONFIG_FILE)
     if not cfg_path.exists():
@@ -183,6 +184,7 @@ def carregar_config():
     R2_BUCKET = cfg["r2_bucket"]
     NUM_WORKERS = int(cfg.get("num_workers", 4))
     FONTES = fontes
+    EXIGIR_PROTOCOLO = bool(cfg.get("exigir_protocolo", True))
 
     NOME_CLIENTE = str(cfg.get("nome_cliente", "")).strip()
     if not NOME_CLIENTE:
@@ -482,12 +484,17 @@ def processar_arquivo(item: ItemFila, client):
         return
 
     # 5. Extração polimórfica das informações fiscais
-    info = extract_fiscal_info(path, usar_destinatario=(item.tipo == "entrada"))
-    if info is None and item.tipo == "saida":
-        # Cancelamentos só em pastas de saída (o evento traz o CNPJ do emitente)
-        info = extract_cancelamento_info(path)
+    # Nota autorizada, cancelamento ou inutilização homologados. Eventos só em
+    # pastas de saída (o evento traz o CNPJ do emitente). O motivo de uma
+    # rejeição (sem protocolo, cStat, sem homologação) é logado pelo parser.
+    info = extract_documento(
+        path,
+        usar_destinatario=(item.tipo == "entrada"),
+        exigir_protocolo=EXIGIR_PROTOCOLO,
+        aceitar_eventos=(item.tipo == "saida"),
+    )
     if info is None:
-        log.info(f"[{item.fonte_nome}] Ignorado (XML não reconhecido): {path.name}")
+        log.info(f"[{item.fonte_nome}] Ignorado (não é nota autorizada nem evento aceito): {path.name}")
         register_ignored(DB_PATH, path, MOTIVO_NAO_RECONHECIDO)
         return
 
@@ -498,10 +505,10 @@ def processar_arquivo(item: ItemFila, client):
 
     # 7. Upload para o Cloudflare R2 com retry exponencial em caso de falha de rede
     try:
-        if info.doc_tipo == "cancelamento":
-            # Pasta própria e nome pela chave: sem colisão e fácil de localizar
+        if info.pasta:
+            # Eventos (cancelamento/inutilização): pasta própria e nome determinístico
             object_key = upload_xml(client, path, info.cnpj, info.ano, info.mes,
-                                    "cancelamento", f"{info.chave}-cancelamento.xml")
+                                    info.pasta, info.nome_objeto)
         else:
             object_key = upload_xml(client, path, info.cnpj, info.ano, info.mes, item.tipo)
         register_upload(DB_PATH, h, path.name, info.cnpj, info.ano, info.mes, object_key)

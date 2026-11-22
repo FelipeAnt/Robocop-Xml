@@ -322,6 +322,7 @@ class ConfiguradorApp:
         self.cfg["num_workers"] = int(self.spin_workers.get())
         self.cfg["nome_cliente"] = nome_cliente
         self.cfg.setdefault("heartbeat_minutos", 15)
+        self.cfg.setdefault("exigir_protocolo", True)
 
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(self.cfg, f, indent=2, ensure_ascii=False)
