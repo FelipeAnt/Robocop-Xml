@@ -44,7 +44,14 @@ def carregar_config() -> dict:
         CONFIG.write_text(json.dumps(MODELO, indent=2), encoding="utf-8")
         print(f"Criei o modelo {CONFIG}. Preencha as credenciais de LEITURA e rode de novo.")
         sys.exit(1)
-    cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
+    try:
+        cfg = json.loads(CONFIG.read_text(encoding="utf-8-sig"))  # tolera BOM do Bloco de Notas
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        print(f"{CONFIG} ilegível ({e}). Corrija o JSON ou apague o arquivo para gerar um modelo novo.")
+        sys.exit(1)
+    if not isinstance(cfg, dict):
+        print(f"{CONFIG} inválido: esperado um objeto JSON.")
+        sys.exit(1)
     faltando = [k for k in MODELO if not cfg.get(k)]
     if faltando:
         print(f"Faltam campos em {CONFIG}: {', '.join(faltando)}")

@@ -12,6 +12,9 @@ do Windows/python.org).
 """
 
 import json
+import os
+import re
+import shutil
 import sys
 import tkinter as tk
 from datetime import datetime
@@ -25,14 +28,7 @@ BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False
 CONFIG_FILE = str(BASE_DIR / "config.json")
 
 
-def carregar_config_existente():
-    path = Path(CONFIG_FILE)
-    if path.exists():
-        try:
-            with open(path, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
+def _config_padrao():
     return {
         "fontes": [],
         "r2_account_id": "",
@@ -43,6 +39,43 @@ def carregar_config_existente():
     }
 
 
+def carregar_config_existente():
+    """Devolve (config, aviso). Se o config.json existir mas estiver ilegível,
+    guarda uma cópia 'config.json.corrompido-<data>' (para não perder nada que
+    dê pra recuperar) e começa de um modelo em branco, avisando o usuário."""
+    path = Path(CONFIG_FILE)
+    if not path.exists():
+        return _config_padrao(), None
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            raise ValueError("o conteúdo não é um objeto JSON")
+        return cfg, None
+    except Exception as e:
+        copia = path.with_name(f"config.json.corrompido-{datetime.now():%Y%m%d-%H%M%S}")
+        try:
+            shutil.copy2(path, copia)
+            onde = f"Uma cópia do arquivo antigo foi guardada em:\n{copia}"
+        except OSError:
+            onde = "Não consegui guardar uma cópia do arquivo antigo."
+        return _config_padrao(), (
+            f"O config.json existente está ilegível ({e}).\n\n{onde}\n\n"
+            f"Preencha tudo de novo e salve para recriar a configuração."
+        )
+
+
+def salvar_config_atomico(cfg: dict):
+    """Grava em arquivo temporário e troca: queda de energia no meio do save
+    não deixa o config.json pela metade (o serviço ficaria sem configuração)."""
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, CONFIG_FILE)
+
+
 class ConfiguradorApp:
     def __init__(self, root):
         self.root = root
@@ -50,10 +83,12 @@ class ConfiguradorApp:
         self.root.geometry("720x640")
         self.root.resizable(False, False)
 
-        self.cfg = carregar_config_existente()
+        self.cfg, aviso_cfg = carregar_config_existente()
 
         self._montar_widgets()
         self._atualizar_lista_fontes()
+        if aviso_cfg:
+            self.root.after(200, lambda: messagebox.showwarning("Configuração antiga ilegível", aviso_cfg))
 
     # ------------------------------------------------------------
     def _montar_widgets(self):
@@ -305,6 +340,25 @@ class ConfiguradorApp:
             )
             return
 
+        if not re.fullmatch(r"[0-9a-fA-F]{32}", account_id):
+            messagebox.showerror(
+                "Account ID inválido",
+                "O Account ID deve ter 32 caracteres (letras a-f e números).\n"
+                "Copie só o ID, sem 'https://' nem '.r2.cloudflarestorage.com'.",
+            )
+            return
+        if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
+            messagebox.showerror(
+                "Bucket inválido",
+                "Nome do bucket: 3 a 63 caracteres, só minúsculas, números e hífen.",
+            )
+            return
+        try:
+            workers = int(self.spin_workers.get())
+        except ValueError:
+            messagebox.showerror("Workers", "Número de workers inválido.")
+            return
+
         self.cfg["r2_account_id"] = account_id
         self.cfg["r2_access_key_id"] = access_key
         aviso_segredo = ""
@@ -319,13 +373,20 @@ class ConfiguradorApp:
             self.cfg["r2_secret_access_key"] = secret_key
             aviso_segredo = f"\n\nATENÇÃO: não consegui criptografar o Secret ({e}); ficou em texto puro."
         self.cfg["r2_bucket"] = bucket
-        self.cfg["num_workers"] = int(self.spin_workers.get())
+        self.cfg["num_workers"] = max(1, min(32, workers))
         self.cfg["nome_cliente"] = nome_cliente
         self.cfg.setdefault("heartbeat_minutos", 15)
         self.cfg.setdefault("exigir_protocolo", True)
 
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.cfg, f, indent=2, ensure_ascii=False)
+        try:
+            salvar_config_atomico(self.cfg)
+        except OSError as e:
+            messagebox.showerror(
+                "Não consegui salvar",
+                f"Erro ao gravar {CONFIG_FILE}:\n{e}\n\n"
+                f"Confira se a pasta permite escrita (rode como administrador).",
+            )
+            return
 
         messagebox.showinfo(
             "Salvo",

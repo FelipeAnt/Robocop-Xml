@@ -116,87 +116,182 @@ def migrar_segredo(cfg: dict, secret_puro: str):
         log.warning(f"Não consegui criptografar o secret no config.json (segue em texto puro): {e}")
 
 
+class ConfigError(Exception):
+    """Config.json ausente, ilegível ou com valores inválidos. Carrega a lista
+    de problemas encontrados (todos de uma vez, para corrigir de uma só vez)."""
+
+    def __init__(self, problemas):
+        self.problemas = [problemas] if isinstance(problemas, str) else list(problemas)
+        super().__init__("; ".join(self.problemas))
+
+
+ESPERA_ERRO_FATAL_SERVICO = 300  # s: evita loop de reinício do NSSM a cada 5s
+
+
+def falha_fatal(titulo: str, problemas):
+    """Registra o erro de configuração e encerra. Como serviço (sem terminal),
+    espera antes de sair: o NSSM reinicia o processo em 5s, e sem a pausa o log
+    encheria de repetições do mesmo erro."""
+    log.error(f"=== {titulo} ===")
+    for p in ([problemas] if isinstance(problemas, str) else problemas):
+        log.error(f"  - {p}")
+    log.error("Corrija com o configurador.py (ou editando o config.json) e reinicie o serviço.")
+    interativo = bool(sys.stdin) and sys.stdin.isatty()
+    if not interativo:
+        log.error(f"Aguardando {ESPERA_ERRO_FATAL_SERVICO}s antes de encerrar (evita reinício em loop).")
+        time.sleep(ESPERA_ERRO_FATAL_SERVICO)
+    sys.exit(1)
+
+
+def _ler_config_json(cfg_path: Path) -> dict:
+    if not cfg_path.exists():
+        raise ConfigError(
+            f"'{cfg_path}' não encontrado. Rode o configurador.py primeiro para criar a "
+            f"configuração (pastas monitoradas, credenciais do R2, etc)."
+        )
+    try:
+        # utf-8-sig: tolera o BOM que o Bloco de Notas do Windows grava
+        with open(cfg_path, encoding="utf-8-sig") as f:
+            cfg = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ConfigError(
+            f"config.json com erro de sintaxe na linha {e.lineno}, coluna {e.colno}: {e.msg}. "
+            f"Se editou à mão, confira vírgulas/aspas; ou refaça com o configurador.py."
+        )
+    except UnicodeDecodeError:
+        raise ConfigError("config.json não está em UTF-8 (arquivo corrompido?). Refaça com o configurador.py.")
+    except OSError as e:
+        raise ConfigError(f"Não consegui ler o config.json: {e}")
+    if not isinstance(cfg, dict):
+        raise ConfigError("config.json inválido: o conteúdo deveria ser um objeto JSON ({ ... }).")
+    return cfg
+
+
+def _texto(cfg: dict, campo: str) -> str:
+    v = cfg.get(campo, "")
+    return v.strip() if isinstance(v, str) else ""
+
+
 def carregar_config():
+    """Lê e valida o config.json. Em caso de problema levanta ConfigError com
+    TODOS os problemas encontrados (não só o primeiro)."""
     global R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, NUM_WORKERS, FONTES
     global NOME_CLIENTE, HEARTBEAT_MIN, EXIGIR_PROTOCOLO
 
-    cfg_path = Path(CONFIG_FILE)
-    if not cfg_path.exists():
-        log.error(
-            f"'{CONFIG_FILE}' não encontrado. Rode 'configurador.py' primeiro "
-            f"para criar a configuração (pastas monitoradas, credenciais do R2, etc)."
-        )
-        sys.exit(1)
+    cfg = _ler_config_json(Path(CONFIG_FILE))
+    problemas = []
 
-    with open(cfg_path, encoding="utf-8") as f:
-        cfg = json.load(f)
-
-    fontes_cfg = cfg.get("fontes", [])
-    if not fontes_cfg:
-        log.error("Nenhuma pasta configurada em 'fontes' no config.json. Use o configurador.py.")
-        sys.exit(1)
-
+    # ---- fontes ----
+    fontes_cfg = cfg.get("fontes")
     fontes = []
-    for f_cfg in fontes_cfg:
-        pasta = Path(f_cfg["pasta"])
-        if not pasta.exists():
-            log.error(f"Pasta configurada não existe, pulando: {pasta}")
-            continue
+    if not isinstance(fontes_cfg, list) or not fontes_cfg:
+        problemas.append("Nenhuma pasta configurada em 'fontes'. Use o configurador.py.")
+    else:
+        vistas = set()
+        for i, f_cfg in enumerate(fontes_cfg, 1):
+            if not isinstance(f_cfg, dict) or not isinstance(f_cfg.get("pasta"), str) or not f_cfg["pasta"].strip():
+                problemas.append(f"Fonte #{i}: campo 'pasta' ausente ou inválido.")
+                continue
+            pasta = Path(f_cfg["pasta"].strip())
+            try:
+                data_inicio = datetime.strptime(str(f_cfg.get("data_inicio", "")), "%Y-%m-%d")
+            except ValueError:
+                problemas.append(f"Fonte '{pasta}': data de início inválida (use AAAA-MM-DD).")
+                continue
+            tipo = f_cfg.get("tipo", "saida")
+            if tipo not in ("saida", "entrada"):
+                log.warning(f"Tipo inválido '{tipo}' para '{pasta}', usando 'saida'.")
+                tipo = "saida"
+            chave = os.path.normcase(os.path.normpath(str(pasta)))
+            if chave in vistas:
+                log.warning(f"Pasta repetida no config.json, ignorando a duplicata: {pasta}")
+                continue
+            vistas.add(chave)
+            if not pasta.is_dir():
+                # Pode ser um drive de rede/pen drive ainda não montado: não impede
+                # as outras pastas. O heartbeat mostra 'existe: False'.
+                log.error(f"Pasta configurada não existe, pulando: {pasta}")
+                continue
+            nome = f_cfg.get("nome")
+            fontes.append({
+                "pasta": pasta,
+                "data_inicio": data_inicio,
+                "nome": nome.strip() if isinstance(nome, str) and nome.strip() else (pasta.name or str(pasta)),
+                "tipo": tipo,
+            })
+        if not fontes and not problemas:
+            problemas.append("Nenhuma das pastas configuradas existe neste PC. Confira os caminhos no configurador.py.")
+
+    # ---- R2 ----
+    conta = _texto(cfg, "r2_account_id")
+    chave_acesso = _texto(cfg, "r2_access_key_id")
+    secret_cfg = _texto(cfg, "r2_secret_access_key")
+    bucket = _texto(cfg, "r2_bucket")
+    for campo, valor in (("r2_account_id", conta), ("r2_access_key_id", chave_acesso),
+                         ("r2_secret_access_key", secret_cfg), ("r2_bucket", bucket)):
+        if not valor:
+            problemas.append(f"Campo obrigatório ausente/vazio: {campo}.")
+    if conta and not re.fullmatch(r"[0-9a-fA-F]{32}", conta):
+        problemas.append("r2_account_id deve ter 32 caracteres hexadecimais (copie só o Account ID, sem https:// nem .r2.cloudflarestorage.com).")
+    if bucket and not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
+        problemas.append(f"Nome de bucket inválido: '{bucket}' (minúsculas, números, hífen; 3 a 63 caracteres).")
+
+    secret_puro = ""
+    if secret_cfg:
         try:
-            data_inicio = datetime.strptime(f_cfg["data_inicio"], "%Y-%m-%d")
-        except (KeyError, ValueError):
-            log.error(f"Data de início inválida para '{pasta}', use AAAA-MM-DD. Pulando essa fonte.")
-            continue
-        tipo = f_cfg.get("tipo", "saida")
-        if tipo not in ("saida", "entrada"):
-            log.warning(f"Tipo inválido '{tipo}' para '{pasta}', usando 'saida'.")
-            tipo = "saida"
-        fontes.append({
-            "pasta": pasta,
-            "data_inicio": data_inicio,
-            "nome": f_cfg.get("nome", pasta.name),
-            "tipo": tipo,
-        })
+            secret_puro = segredo.revelar(secret_cfg)
+        except segredo.SegredoIndisponivel as e:
+            problemas.append(
+                "Não consegui abrir o Secret Access Key. Isso acontece quando o config.json foi COPIADO "
+                "de outro computador (o segredo só abre na máquina onde foi salvo) ou está corrompido. "
+                f"Rode o configurador.py neste PC e digite o Secret de novo. Detalhe: {e}"
+            )
 
-    if not fontes:
-        log.error("Nenhuma fonte válida para monitorar. Verifique o config.json.")
-        sys.exit(1)
-
-    for campo in ("r2_account_id", "r2_access_key_id", "r2_secret_access_key", "r2_bucket"):
-        if not cfg.get(campo):
-            log.error(f"Campo obrigatório ausente no config.json: {campo}. Use o configurador.py.")
-            sys.exit(1)
-
-    R2_ACCOUNT_ID = cfg["r2_account_id"]
-    R2_ACCESS_KEY_ID = cfg["r2_access_key_id"]
+    # ---- opções numéricas / booleanas (valor ruim = padrão + aviso, não derruba) ----
     try:
-        R2_SECRET_ACCESS_KEY = segredo.revelar(cfg["r2_secret_access_key"])
-    except segredo.SegredoIndisponivel as e:
-        log.error(
-            "Não consegui abrir o Secret Access Key do config.json. Isso acontece quando o "
-            "config.json foi COPIADO de outro computador (o segredo só abre na máquina onde "
-            f"foi salvo) ou está corrompido. Rode o configurador.py neste PC e digite o "
-            f"Secret de novo. Detalhe: {e}"
-        )
-        sys.exit(1)
-    if segredo.disponivel() and not segredo.esta_protegido(cfg["r2_secret_access_key"]):
-        migrar_segredo(cfg, R2_SECRET_ACCESS_KEY)
-    R2_BUCKET = cfg["r2_bucket"]
-    NUM_WORKERS = int(cfg.get("num_workers", 4))
-    FONTES = fontes
-    EXIGIR_PROTOCOLO = bool(cfg.get("exigir_protocolo", True))
+        workers = int(cfg.get("num_workers", 4))
+    except (TypeError, ValueError):
+        log.warning("num_workers inválido, usando 4.")
+        workers = 4
+    if not 1 <= workers <= 32:
+        log.warning(f"num_workers={workers} fora de 1-32, ajustando.")
+        workers = max(1, min(32, workers))
 
-    NOME_CLIENTE = str(cfg.get("nome_cliente", "")).strip()
+    try:
+        heartbeat = int(cfg.get("heartbeat_minutos", 15))
+        if heartbeat < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        log.warning("heartbeat_minutos inválido, usando 15.")
+        heartbeat = 15
+
+    exigir = cfg.get("exigir_protocolo", True)
+    if not isinstance(exigir, bool):
+        log.warning("exigir_protocolo deve ser true ou false; usando true.")
+        exigir = True
+
+    if problemas:
+        raise ConfigError(problemas)
+
+    R2_ACCOUNT_ID = conta
+    R2_ACCESS_KEY_ID = chave_acesso
+    R2_SECRET_ACCESS_KEY = secret_puro
+    R2_BUCKET = bucket
+    NUM_WORKERS = workers
+    HEARTBEAT_MIN = heartbeat
+    EXIGIR_PROTOCOLO = exigir
+    FONTES = fontes
+
+    if segredo.disponivel() and not segredo.esta_protegido(secret_cfg):
+        migrar_segredo(cfg, secret_puro)
+
+    NOME_CLIENTE = _texto(cfg, "nome_cliente")
     if not NOME_CLIENTE:
         NOME_CLIENTE = socket.gethostname()
         log.warning(
             f"'nome_cliente' não definido no config.json; usando o nome do PC ({NOME_CLIENTE}) "
             f"no monitoramento. Defina o nome do cliente no configurador.py."
         )
-    try:
-        HEARTBEAT_MIN = int(cfg.get("heartbeat_minutos", 15))
-    except (TypeError, ValueError):
-        HEARTBEAT_MIN = 15
 
 
 # ------------------------------------------------------------------
@@ -596,19 +691,47 @@ def reconciliation_loop(intervalo: int = 1800, stop_event: Optional[threading.Ev
 # MAIN
 # ------------------------------------------------------------------
 
+# Erros do R2 que não se resolvem sozinhos: credencial/bucket errados.
+CODIGOS_R2_FATAIS = {"403", "401", "404", "AccessDenied", "InvalidAccessKeyId",
+                     "SignatureDoesNotMatch", "NoSuchBucket", "NoSuchKey", "InvalidBucketName"}
+
+
+def conectar_r2():
+    """Cria o client e valida o bucket. Credencial/bucket errados são fatais
+    (config a corrigir); rede fora do ar/DNS/relógio é transitório: tenta de
+    novo com espera crescente, pois o PC pode ter acabado de ligar."""
+    espera = 5
+    while True:
+        try:
+            client = build_r2_client()
+            client.head_bucket(Bucket=R2_BUCKET)
+            log.info(f"Conectado ao bucket '{R2_BUCKET}' com sucesso.")
+            return client
+        except ClientError as e:
+            err = e.response.get("Error", {}) if hasattr(e, "response") else {}
+            codigo = str(err.get("Code", ""))
+            if codigo in CODIGOS_R2_FATAIS:
+                falha_fatal(
+                    "R2 recusou o acesso",
+                    [f"Código {codigo} ao acessar o bucket '{R2_BUCKET}'.",
+                     "Confira r2_access_key_id, r2_secret_access_key, r2_account_id e r2_bucket.",
+                     "Se o token foi revogado/expirou, gere outro no Cloudflare e refaça no configurador.py."])
+            log.warning(f"R2 respondeu com erro temporário ({codigo or e}); nova tentativa em {espera}s.")
+        except Exception as e:
+            log.warning(f"Sem conexão com o R2 ({type(e).__name__}: {e}); nova tentativa em {espera}s.")
+        time.sleep(espera)
+        espera = min(60, espera * 2)
+
+
 def main():
-    carregar_config()
+    try:
+        carregar_config()
+    except ConfigError as e:
+        falha_fatal("Erro de configuração", e.problemas)
     init_db(DB_PATH)
 
     log.info("Conectando ao Cloudflare R2...")
-    client = build_r2_client()
-    try:
-        client.head_bucket(Bucket=R2_BUCKET)
-        log.info(f"Conectado ao bucket '{R2_BUCKET}' com sucesso.")
-    except ClientError as e:
-        log.error(f"Não consegui acessar o bucket '{R2_BUCKET}': {e}")
-        log.error("Confira r2_account_id, r2_access_key_id, r2_secret_access_key e r2_bucket no config.json.")
-        sys.exit(1)
+    client = conectar_r2()
 
     for i in range(NUM_WORKERS):
         t = threading.Thread(target=worker_loop, args=(client,), name=f"worker-{i}", daemon=True)
