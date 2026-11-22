@@ -32,13 +32,13 @@ if %errorLevel% neq 0 (
 :: PyInstaller detecta e empacota esses modulos sozinho (sao so biblioteca
 :: padrao por dentro), mas so se os .py estiverem fisicamente aqui do lado.
 set "FALTANDO="
-for %%F in (robocop_clone.py configurador.py db_manager.py fiscal_parser.py stability.py segredo.py requirements.txt) do (
+for %%F in (robocop_clone.py configurador.py db_manager.py fiscal_parser.py stability.py segredo.py r2_teste.py requirements.txt) do (
     if not exist "%%F" set "FALTANDO=!FALTANDO! %%F"
 )
 if defined FALTANDO (
     echo [ERRO] Arquivo^(s^) faltando nesta pasta: %FALTANDO%
     echo Todos os modulos ^(robocop_clone.py, configurador.py, db_manager.py,
-    echo fiscal_parser.py, stability.py, segredo.py^) e o requirements.txt precisam estar
+    echo fiscal_parser.py, stability.py, segredo.py, r2_teste.py^) e o requirements.txt precisam estar
     echo juntos, na mesma pasta, antes de rodar o build.
     pause
     exit /b 1

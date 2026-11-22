@@ -16,11 +16,13 @@ import os
 import re
 import shutil
 import sys
+import threading
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+import r2_teste
 import segredo
 
 BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) \
@@ -175,6 +177,10 @@ class ConfiguradorApp:
         frame_salvar = ttk.Frame(self.root)
         frame_salvar.pack(fill="x", padx=10, pady=10)
         ttk.Button(frame_salvar, text="Salvar configuração", command=self._salvar).pack(side="right")
+        self.btn_testar = ttk.Button(frame_salvar, text="Testar conexão", command=self._testar_conexao)
+        self.btn_testar.pack(side="left")
+        self.lbl_teste = ttk.Label(frame_salvar, text="", foreground="#555555")
+        self.lbl_teste.pack(side="left", padx=10)
 
     # ------------------------------------------------------------
     def _atualizar_lista_fontes(self):
@@ -320,6 +326,35 @@ class ConfiguradorApp:
             self._atualizar_lista_fontes()
 
     # ------------------------------------------------------------
+    def _testar_conexao(self):
+        """Testa os valores digitados (não precisa salvar antes). Roda em thread
+        para a janela não congelar; o resultado volta pela fila do Tk."""
+        dados = (self.entry_account_id.get(), self.entry_access_key.get(),
+                 self.entry_secret_key.get(), self.entry_bucket.get())
+        self.btn_testar.config(state="disabled")
+        self.lbl_teste.config(text="Testando...")
+        resultado = {}
+
+        def trabalho():
+            try:
+                resultado["r"] = r2_teste.testar_conexao(*dados)
+            except Exception as e:  # nunca deixa o botão preso
+                resultado["r"] = (False, f"Erro inesperado no teste: {e}")
+
+        t = threading.Thread(target=trabalho, daemon=True)
+        t.start()
+
+        def aguardar():
+            if t.is_alive():
+                self.root.after(150, aguardar)
+                return
+            ok, msg = resultado.get("r", (False, "Teste não retornou resultado."))
+            self.btn_testar.config(state="normal")
+            self.lbl_teste.config(text="Conexão OK" if ok else "Falhou")
+            (messagebox.showinfo if ok else messagebox.showerror)("Teste de conexão", msg)
+
+        self.root.after(150, aguardar)
+
     def _salvar(self):
         account_id = self.entry_account_id.get().strip()
         access_key = self.entry_access_key.get().strip()
